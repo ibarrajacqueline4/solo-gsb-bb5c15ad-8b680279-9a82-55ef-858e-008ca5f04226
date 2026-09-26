@@ -1727,6 +1727,64 @@ def test_trim_safety_touching_safe_line_passes():
     assert response.json()["violations"] == []
 
 
+def test_trim_safety_near_boundary_not_swallowed_by_tolerance():
+    # 回归：页宽高 100、外裁 5，第 4 页左槽矩形左缘 4.99999995（差 5e-8），
+    # 旧实现的 1e-9×页宽 容差将外侧越线漏报
+    body = {
+        **TRIM_SAFETY_BASE,
+        "outer_trim_mm": 5,
+        "page_protected": [
+            {"page": 4, "rectangles": [
+                {"x_mm": 4.99999995, "y_mm": 10,
+                 "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    data = client.post("/api/v1/impose/trim-safety", json=body).json()
+    assert [(v["page"], v["edge"]) for v in data["violations"]] == [(4, "outer")]
+    assert data["violations"][0]["rectangle"]["x_mm"] == 4.99999995
+    # 恰好 5 贴线合格
+    body["page_protected"][0]["rectangles"][0]["x_mm"] = 5
+    assert client.post(
+        "/api/v1/impose/trim-safety", json=body
+    ).json()["violations"] == []
+
+
+def test_trim_safety_huge_gutter_reports_outer_and_top():
+    # 回归：中缝 1e12 时旧容差随纸面放大，连顶边、外侧越线都漏报
+    body = {
+        **TRIM_SAFETY_BASE,
+        "gutter_mm": 1e12,
+        "outer_trim_mm": 5,
+        "fold_safety_mm": 5,
+        "page_protected": [
+            {"page": 4, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert [v["edge"] for v in data["violations"]] == ["top", "outer"]
+    assert data["paper_width_mm"] == 1e12 + 200
+
+
+def test_trim_safety_rect_overflow_by_tiny_amount_returns_422():
+    # 页内矩形哪怕只越界 5e-8 也必须 422，不能夹回页面
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_protected": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 100.00000005, "height_mm": 10},
+            ]},
+        ],
+    }
+    assert client.post(
+        "/api/v1/impose/trim-safety", json=body
+    ).status_code == 422
+
+
 def test_trim_safety_all_four_edges_reported_in_order():
     # 左槽第 4 页整页出血矩形：四边全越，顺序 top,bottom,outer,fold
     body = {

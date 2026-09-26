@@ -81,6 +81,116 @@ def test_touching_safe_lines_passes():
     assert result["violations"] == []
 
 
+def test_near_boundary_not_swallowed_by_tolerance():
+    # 回归：页宽高均 100、外裁 5，第 4 页左槽矩形左缘 4.99999995，
+    # 距外侧安全线 5 仅差 5e-8，旧实现的 1e-9×页宽 容差将其漏报
+    result = _trim(
+        [(4, [(4.99999995, 10, 10, 10)])],
+        outer_trim_mm=5.0,
+    )
+    assert _edges(result) == [(1, 1, "front", 4, "outer")]
+    rect = result["violations"][0]["rectangle"]
+    assert rect["x_mm"] == 4.99999995 and rect["width_mm"] == 10.0
+    # 恰好 5 贴线合格（差一丝也不行，恰好贴线可以）
+    result = _trim([(4, [(5.0, 10, 10, 10)])], outer_trim_mm=5.0)
+    assert result["violations"] == []
+
+
+def test_huge_gutter_does_not_mask_outer_and_top_violations():
+    # 回归：中缝 1e12 时旧实现容差随纸面放大到约 1000，连顶边、外侧越线都漏报
+    result = _trim(
+        [(4, [(0, 0, 10, 10)])],
+        gutter_mm=1e12,
+        outer_trim_mm=5.0,
+        fold_safety_mm=5.0,
+    )
+    # 左槽第 4 页：顶边（y=0<5）与外侧（x=0<5）逐边上报；折缝在远端不越
+    assert _edges(result) == [
+        (1, 1, "front", 4, "top"),
+        (1, 1, "front", 4, "outer"),
+    ]
+    rect = result["violations"][0]["rectangle"]
+    assert rect == {"x_mm": 0.0, "y_mm": 0.0, "width_mm": 10.0, "height_mm": 10.0}
+    assert result["paper_width_mm"] == 1e12 + 200
+    # 右槽第 1 页：只越顶边；折缝安全线在 5e11 附近，矩形远不触及
+    result = _trim(
+        [(1, [(0, 0, 10, 10)])],
+        gutter_mm=1e12,
+        outer_trim_mm=5.0,
+        fold_safety_mm=5.0,
+    )
+    assert _edges(result) == [(1, 1, "front", 1, "top")]
+
+
+def test_decimal_shortest_representation_used_for_bounds():
+    # 尺寸按解析后数值的最短十进制表示核算：
+    # float 0.30000000000000004 的最短表示即 0.30000000000000004，
+    # 与 99.7 之和严格大于 100 -> 页内越界 422（不允许夹回）
+    with pytest.raises(ValueError):
+        _trim([(1, [(0.30000000000000004, 0, 99.7, 10)])])
+    # 0.1 + 99.9 按十进制恰好 100：页内不越界（是否越安全线另算）
+    result = _trim(
+        [(4, [(0.1, 0, 99.9, 10)])],
+        outer_trim_mm=0.0,
+        fold_safety_mm=0.0,
+    )
+    assert result["violations"] == []
+
+
+def test_page_overflow_is_rejected_not_clamped():
+    # 页内矩形任何越界都 422，不能夹回页面后参与判定
+    for rect in (
+        (0.0, 0.0, 100.00000001, 10.0),
+        (-1e-12, 0.0, 10.0, 10.0),
+        (0.0, 0.0, 10.0, 100.000000001),
+        (5e-13, 0.0, 100.0, 10.0),
+    ):
+        with pytest.raises(ValueError):
+            _trim([(1, [rect])])
+    # 非整数页宽同样严格：恰好贴边合格，超出一丝 422
+    result = _trim(
+        [(4, [(0, 0, 100.1, 100)])],
+        page_width_mm=100.1,
+        outer_trim_mm=0.0,
+        fold_safety_mm=0.0,
+    )
+    assert result["violations"] == []
+    with pytest.raises(ValueError):
+        _trim([(4, [(0, 0, 100.10000001, 10)])], page_width_mm=100.1)
+
+
+def test_short_flip_right_binding_exact_touch_and_cross():
+    # 右装订 + short 背面：背左 = 第 3 页（保持槽位、180° 旋转）
+    # 页内 (95,95,5,5) -> 纸面 (0,0,5,5)：顶边、外侧严格越线 5
+    result = _trim(
+        [(3, [(95, 95, 5, 5)])],
+        binding="right",
+        duplex_flip="short",
+        outer_trim_mm=5.0,
+    )
+    assert _edges(result) == [
+        (1, 1, "back", 3, "top"),
+        (1, 1, "back", 3, "outer"),
+    ]
+    # 页内 (90,90,5,5) -> 纸面 (5,5,5,5)：恰好贴线合格
+    result = _trim(
+        [(3, [(90, 90, 5, 5)])],
+        binding="right",
+        duplex_flip="short",
+        outer_trim_mm=5.0,
+    )
+    assert result["violations"] == []
+    # 页内 (0,90,5,5) -> 纸面 (95,5,5,5)：右缘 100 严格越过折缝安全线 95
+    result = _trim(
+        [(3, [(0, 90, 5, 5)])],
+        binding="right",
+        duplex_flip="short",
+        outer_trim_mm=5.0,
+        fold_safety_mm=5.0,
+    )
+    assert _edges(result) == [(1, 1, "back", 3, "fold")]
+
+
 def test_zero_safety_distances_touches_paper_edges():
     # 安全距离全 0：矩形铺满整页（映射后铺满槽位、右缘压折缝线）仍合格
     result = _trim(
