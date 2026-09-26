@@ -26,6 +26,7 @@ from .press_geometry import (
     PressGeometry,
     DuplexFlip,
     Side,
+    Slot,
     placement_payload,
 )
 
@@ -601,6 +602,39 @@ PageProtected = Tuple[int, List[ProtectedRect]]
 # 外裁），fold=中缝折缝侧
 TRIM_EDGE_ORDER: Tuple[str, ...] = ("top", "bottom", "outer", "fold")
 
+# 十进制页内矩形：(左上角 x, 左上角 y, 宽, 高)，
+# 由请求数值的最短十进制表示精确转换（见 _to_decimal）
+DecimalRect = Tuple[Decimal, Decimal, Decimal, Decimal]
+
+
+def _page_rect_to_paper_decimal(
+    slot: Slot,
+    rotation_deg: Literal[0, 180],
+    page_width_d: Decimal,
+    page_height_d: Decimal,
+    gutter_d: Decimal,
+    rect: DecimalRect,
+) -> DecimalRect:
+    """页内矩形 -> 纸面矩形的十进制精确映射（trim-safety 安全判定专用）。
+
+    规则与 :meth:`PressGeometry.page_rect_to_paper` 一一对应（槽位原点见
+    :meth:`PressGeometry.slot_origin_x_mm`：左槽 ``x = 0``、右槽
+    ``x = 页宽 + 中缝``，``y`` 恒为 0；0° 平移、180° 绕页位中心旋转，
+    宽高均不变），只是全部按十进制尺寸计算，避免二进制浮点误差影响
+    贴线判定。
+    """
+    x_d, y_d, width_d, height_d = rect
+    slot_x_d = Decimal(0) if slot == "left" else page_width_d + gutter_d
+    slot_y_d = Decimal(0)
+    if rotation_deg == 180:
+        return (
+            slot_x_d + page_width_d - x_d - width_d,
+            slot_y_d + page_height_d - y_d - height_d,
+            width_d,
+            height_d,
+        )
+    return (slot_x_d + x_d, slot_y_d + y_d, width_d, height_d)
+
 
 def trim_safety(
     total_pages: int,
@@ -618,9 +652,9 @@ def trim_safety(
 
     页序、分帖、槽位与旋转规则与 :func:`press_layout` 完全同源（统一由
     :class:`PressGeometry` 决定）。请求按**实际页码**给出**阅读方向**的页内受保护
-    矩形（以页面左上角为原点），矩形先经 :meth:`PressGeometry.page_rect_to_paper`
-    按所在页位的 ``rotation_deg`` 映射到纸面坐标（与 :func:`ink_zones` 共用同一
-    0°/180° 矩形变换）：
+    矩形（以页面左上角为原点），矩形按所在页位的 ``rotation_deg`` 映射到纸面坐标
+    （与 :meth:`PressGeometry.page_rect_to_paper` 相同的 0°/180° 规则，十进制
+    精确版本见 :func:`_page_rect_to_paper_decimal`）：
 
     - 0°：纸面左上角 = 槽位左上角 + 矩形左上角，宽高不变；
     - 180°：绕页位中心旋转，纸面左上角 =
@@ -633,6 +667,11 @@ def trim_safety(
     - **中缝侧**（左槽矩形右边、右槽矩形左边）：与折缝线保持 ``fold_safety_mm``；
     - **其余三边**（纸面顶边、底边与外侧竖边——左槽靠左纸边、右槽靠右纸边）：
       与纸面边缘保持 ``outer_trim_mm``。
+
+    所有尺寸（页宽/页高/中缝/安全距离/矩形坐标与宽高）一律按解析后数值的
+    **最短十进制表示**（``Decimal``，与 :func:`plan_stock` 同一约定）精确核算，
+    **不设浮点容差**：页内矩形任何越界都判定为请求非法（不夹回页面）；安全线
+    只在严格越过时记违规，恰好贴线合格。
 
     逐帖、逐张、逐面（front → back）、逐槽（left → right）、按请求矩形顺序返回
     每处越线，给出帖号、张号、正反面、页码、违规边（``top`` / ``bottom`` /
@@ -656,6 +695,15 @@ def trim_safety(
         ):
             raise ValueError(f"{name}必须为非负有限数值（单位 mm）")
 
+    # 尺寸一律按解析后数值的最短十进制表示（Decimal）精确核算：
+    # 浮点容差会把 1e-9 量级的越线（如 4.99999995 < 5）误判为贴线，
+    # 而随纸面尺寸放大的容差在中缝极大（如 1e12）时会吞掉整页宽度的越线
+    page_width_d = _to_decimal(page_width_mm)
+    page_height_d = _to_decimal(page_height_mm)
+    gutter_d = _to_decimal(gutter_mm)
+    outer_trim_d = _to_decimal(outer_trim_mm)
+    fold_safety_d = _to_decimal(fold_safety_mm)
+
     protected_by_page: dict = {}
     for item_index, (page, rects) in enumerate(page_protected, start=1):
         if not isinstance(page, int) or isinstance(page, bool) or not (
@@ -669,9 +717,7 @@ def trim_safety(
             raise ValueError(f"第 {page} 页的受保护矩形重复给出，每页只能出现一次")
         if not rects:
             raise ValueError(f"第 {page} 页至少需要给出 1 个受保护矩形")
-        scale = max(1.0, page_width_mm, page_height_mm)
-        tolerance = 1e-9 * scale
-        validated: List[ProtectedRect] = []
+        validated: List[DecimalRect] = []
         for rect_index, rect in enumerate(rects, start=1):
             if len(rect) != 4:
                 raise ValueError(f"第 {page} 页第 {rect_index} 个矩形字段不完整")
@@ -681,32 +727,31 @@ def trim_safety(
                     f"第 {page} 页第 {rect_index} 个矩形含非有限数值"
                     "（NaN / Infinity）"
                 )
-            if rx < -tolerance or ry < -tolerance:
-                raise ValueError(
-                    f"第 {page} 页第 {rect_index} 个矩形越出页面："
-                    f"左上角 ({rx}, {ry}) 不能为负"
+            rx_d, ry_d, rw_d, rh_d = (_to_decimal(v) for v in (rx, ry, rw, rh))
+            with localcontext() as ctx:
+                ctx.prec = _decimal_prec(
+                    page_width_d, page_height_d, rx_d, ry_d, rw_d, rh_d
                 )
-            if rw <= 0 or rh <= 0:
-                raise ValueError(
-                    f"第 {page} 页第 {rect_index} 个矩形越界：宽、高必须为正数"
-                )
-            if rx + rw > page_width_mm + tolerance or (
-                ry + rh > page_height_mm + tolerance
-            ):
-                raise ValueError(
-                    f"第 {page} 页第 {rect_index} 个矩形越出页面："
-                    f"矩形 ({rx}, {ry}, {rw}, {rh}) 须完整落在 "
-                    f"{page_width_mm} × {page_height_mm}（mm）的页面内"
-                )
-            # 夹回边界，消除贴边时的浮点误差
-            rx = max(0.0, min(rx, page_width_mm))
-            ry = max(0.0, min(ry, page_height_mm))
-            rw = min(rw, page_width_mm - rx)
-            rh = min(rh, page_height_mm - ry)
-            validated.append((rx, ry, rw, rh))
+                # 任何越界都是请求错误：严格按十进制判定，不容差、不夹回页面
+                if rx_d < 0 or ry_d < 0:
+                    raise ValueError(
+                        f"第 {page} 页第 {rect_index} 个矩形越出页面："
+                        f"左上角 ({rx}, {ry}) 不能为负"
+                    )
+                if rw_d <= 0 or rh_d <= 0:
+                    raise ValueError(
+                        f"第 {page} 页第 {rect_index} 个矩形越界：宽、高必须为正数"
+                    )
+                if rx_d + rw_d > page_width_d or ry_d + rh_d > page_height_d:
+                    raise ValueError(
+                        f"第 {page} 页第 {rect_index} 个矩形越出页面："
+                        f"矩形 ({rx}, {ry}, {rw}, {rh}) 须完整落在 "
+                        f"{page_width_mm} × {page_height_mm}（mm）的页面内"
+                    )
+            validated.append((rx_d, ry_d, rw_d, rh_d))
         protected_by_page[page] = validated
 
-    geometry, layout = _build_press_layout(
+    _geometry, layout = _build_press_layout(
         total_pages,
         max_sheets,
         binding,
@@ -715,62 +760,77 @@ def trim_safety(
         gutter_mm,
         duplex_flip,
     )
-    paper_width = layout["paper_width_mm"]
-    paper_height = layout["paper_height_mm"]
-    # 折缝线：纸面（中缝）中心线（共享几何）
-    fold_x = geometry.fold_x_mm
-    tolerance = 1e-9 * max(1.0, paper_width, paper_height)
+
+    # 纸面几何与安全线判定同样按十进制精确核算（精度覆盖全部尺寸的有效位）
+    all_sizes = [page_width_d, page_height_d, gutter_d, outer_trim_d, fold_safety_d]
+    for page_rects in protected_by_page.values():
+        for rect_d in page_rects:
+            all_sizes.extend(rect_d)
 
     violations: List[dict] = []
-    for signature in layout["signatures"]:
-        for sheet in signature["sheets"]:
-            for side in ("front", "back"):
-                for slot in ("left", "right"):
-                    placement = sheet[side][slot]
-                    if placement is None:
-                        continue  # 空白页位（末帖补白）跳过
-                    rects = protected_by_page.get(placement.page)
-                    if not rects:
-                        continue
-                    for rx, ry, rw, rh in rects:
-                        # 页内矩形 -> 纸面矩形（共享的双向矩形变换）
-                        px, py, rw, rh = geometry.page_rect_to_paper(
-                            placement, rx, ry, rw, rh
-                        )
-                        # 追加顺序与 TRIM_EDGE_ORDER 一致（top,bottom,outer,fold）
-                        crossed: List[str] = []
-                        if py < outer_trim_mm - tolerance:
-                            crossed.append("top")
-                        if py + rh > paper_height - outer_trim_mm + tolerance:
-                            crossed.append("bottom")
-                        if slot == "left":
-                            # 左槽：左缘为纸面外侧裁边，右边朝折缝
-                            if px < outer_trim_mm - tolerance:
-                                crossed.append("outer")
-                            if px + rw > fold_x - fold_safety_mm + tolerance:
-                                crossed.append("fold")
-                        else:
-                            # 右槽：右缘为纸面外侧裁边，左边朝折缝
-                            if px + rw > paper_width - outer_trim_mm + tolerance:
-                                crossed.append("outer")
-                            if px < fold_x + fold_safety_mm - tolerance:
-                                crossed.append("fold")
-                        for edge in crossed:
-                            violations.append(
-                                {
-                                    "signature_index": signature["signature_index"],
-                                    "sheet_index": sheet["sheet_index"],
-                                    "side": side,
-                                    "page": placement.page,
-                                    "edge": edge,
-                                    "rectangle": {
-                                        "x_mm": px,
-                                        "y_mm": py,
-                                        "width_mm": rw,
-                                        "height_mm": rh,
-                                    },
-                                }
+    with localcontext() as ctx:
+        ctx.prec = _decimal_prec(*all_sizes)
+        paper_width_d = 2 * page_width_d + gutter_d
+        paper_height_d = page_height_d
+        # 折缝线：纸面（中缝）中心线（与 PressGeometry.fold_x_mm 一致）
+        fold_x_d = paper_width_d / 2
+        for signature in layout["signatures"]:
+            for sheet in signature["sheets"]:
+                for side in ("front", "back"):
+                    for slot in ("left", "right"):
+                        placement = sheet[side][slot]
+                        if placement is None:
+                            continue  # 空白页位（末帖补白）跳过
+                        rects_d = protected_by_page.get(placement.page)
+                        if not rects_d:
+                            continue
+                        for rect_d in rects_d:
+                            # 页内矩形 -> 纸面矩形（十进制精确映射，规则同共享几何）
+                            px_d, py_d, rw_d, rh_d = _page_rect_to_paper_decimal(
+                                slot,
+                                placement.rotation_deg,
+                                page_width_d,
+                                page_height_d,
+                                gutter_d,
+                                rect_d,
                             )
+                            # 追加顺序与 TRIM_EDGE_ORDER 一致（top,bottom,outer,fold）；
+                            # 仅严格越线才记违规，恰好贴线合格
+                            crossed: List[str] = []
+                            if py_d < outer_trim_d:
+                                crossed.append("top")
+                            if py_d + rh_d > paper_height_d - outer_trim_d:
+                                crossed.append("bottom")
+                            if slot == "left":
+                                # 左槽：左缘为纸面外侧裁边，右边朝折缝
+                                if px_d < outer_trim_d:
+                                    crossed.append("outer")
+                                if px_d + rw_d > fold_x_d - fold_safety_d:
+                                    crossed.append("fold")
+                            else:
+                                # 右槽：右缘为纸面外侧裁边，左边朝折缝
+                                if px_d + rw_d > paper_width_d - outer_trim_d:
+                                    crossed.append("outer")
+                                if px_d < fold_x_d + fold_safety_d:
+                                    crossed.append("fold")
+                            for edge in crossed:
+                                violations.append(
+                                    {
+                                        "signature_index": signature[
+                                            "signature_index"
+                                        ],
+                                        "sheet_index": sheet["sheet_index"],
+                                        "side": side,
+                                        "page": placement.page,
+                                        "edge": edge,
+                                        "rectangle": {
+                                            "x_mm": float(px_d),
+                                            "y_mm": float(py_d),
+                                            "width_mm": float(rw_d),
+                                            "height_mm": float(rh_d),
+                                        },
+                                    }
+                                )
 
     return {
         "total_pages": total_pages,
@@ -780,8 +840,8 @@ def trim_safety(
         "page_height_mm": page_height_mm,
         "gutter_mm": gutter_mm,
         "duplex_flip": duplex_flip,
-        "paper_width_mm": paper_width,
-        "paper_height_mm": paper_height,
+        "paper_width_mm": float(paper_width_d),
+        "paper_height_mm": float(paper_height_d),
         "outer_trim_mm": outer_trim_mm,
         "fold_safety_mm": fold_safety_mm,
         "violation_count": len(violations),

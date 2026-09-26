@@ -286,6 +286,101 @@ def test_rect_out_of_page_raises():
             _trim([(1, [rect])])
 
 
+def test_rect_marginally_out_of_page_raises():
+    # 回归：页内矩形任何越界均抛 ValueError（API 层 422），不再按容差夹回页面
+    for rect in (
+        (99.999999995, 0.0, 0.00000001, 10.0),   # x + w = 100.000000005 > 100
+        (-0.000000001, 0.0, 10.0, 10.0),          # x 微负
+        (0.0, 99.999999995, 10.0, 0.00000001),    # y + h = 100.000000005 > 100
+    ):
+        with pytest.raises(ValueError):
+            _trim([(1, [rect])])
+    # 恰好贴边仍合法（安全距离为 0 时满页出血合格）
+    result = _trim(
+        [(1, [(0.0, 0.0, 100.0, 100.0)])],
+        outer_trim_mm=0.0,
+        fold_safety_mm=0.0,
+    )
+    assert result["violations"] == []
+
+
+def test_sub_tolerance_crossings_detected():
+    # 回归（容差漏报）：安全线按最短十进制表示精确核算，仅严格越过才报
+    # 外裁 5：第 4 页左槽 x=4.99999995 严格越过外侧安全线（旧容差 2e-7 漏报）
+    result = _trim([(4, [(4.99999995, 10, 10, 10)])], outer_trim_mm=5.0)
+    assert _edges(result) == [(1, 1, "front", 4, "outer")]
+    assert result["violations"][0]["rectangle"] == {
+        "x_mm": 4.99999995, "y_mm": 10.0, "width_mm": 10.0, "height_mm": 10.0,
+    }
+    # 恰好 5.0 贴线仍合格
+    assert _trim([(4, [(5.0, 10, 10, 10)])], outer_trim_mm=5.0)["violations"] == []
+    # 折缝：左槽右缘安全线 95（fold=5），95.0000001 严格越过；恰好 95 合格
+    result = _trim([(4, [(10, 50, 85.0000001, 10)])])
+    assert _edges(result) == [(1, 1, "front", 4, "fold")]
+    assert _trim([(4, [(10, 50, 85.0, 10)])])["violations"] == []
+    # 顶边：y=9.99999995 越过安全线 10；恰好 10 合格
+    result = _trim([(4, [(50, 9.99999995, 10, 10)])])
+    assert _edges(result) == [(1, 1, "front", 4, "top")]
+    assert _trim([(4, [(50, 10.0, 10, 10)])])["violations"] == []
+    # 底边：y+h=90.00000005 越过安全线 90；恰好 90 合格
+    result = _trim([(4, [(50, 85, 10, 5.00000005)])])
+    assert _edges(result) == [(1, 1, "front", 4, "bottom")]
+    assert _trim([(4, [(50, 85, 10, 5.0)])])["violations"] == []
+    # 右槽外侧：右缘 190.00000005 越过安全线 190；恰好 190 合格
+    result = _trim([(1, [(80.00000005, 50, 10, 10)])])
+    assert _edges(result) == [(1, 1, "front", 1, "outer")]
+    assert _trim([(1, [(80.0, 50, 10, 10)])])["violations"] == []
+
+
+def test_huge_gutter_does_not_mask_violations():
+    # 回归：中缝 1e12 时旧容差随纸面尺寸放大到约 1000 mm，吞掉整页宽度的越线
+    result = _trim([(4, [(0, 0, 10, 10)])], gutter_mm=1e12, outer_trim_mm=5.0)
+    assert _edges(result) == [
+        (1, 1, "front", 4, "top"),
+        (1, 1, "front", 4, "outer"),
+    ]
+    assert result["paper_width_mm"] == 1000000000200.0
+    # 巨大中缝下折缝安全线仍精确：左槽右缘 100 距折缝线 5e11，不误报 fold
+    result = _trim(
+        [(4, [(0, 0, 100, 100)])],
+        gutter_mm=1e12,
+        outer_trim_mm=5.0,
+        fold_safety_mm=5.0,
+    )
+    assert _edges(result) == [
+        (1, 1, "front", 4, "top"),
+        (1, 1, "front", 4, "bottom"),
+        (1, 1, "front", 4, "outer"),
+    ]
+
+
+def test_precision_mapping_covers_binding_and_flip():
+    # 回归：精确判定覆盖左右装订与长短边翻转的 0°/180° 映射
+    # 右装订：第 1 页在正面左槽，x=4.99999995 越外侧安全线 5
+    result = _trim(
+        [(1, [(4.99999995, 10, 10, 10)])], binding="right", outer_trim_mm=5.0
+    )
+    assert _edges(result) == [(1, 1, "front", 1, "outer")]
+    # short 背面 180°：背左第 2 页页内 (85.00000005,50,10,10) -> 纸面 x=4.99999995
+    result = _trim(
+        [(2, [(85.00000005, 50, 10, 10)])], duplex_flip="short", outer_trim_mm=5.0
+    )
+    assert _edges(result) == [(1, 1, "back", 2, "outer")]
+    assert result["violations"][0]["rectangle"] == {
+        "x_mm": 4.99999995, "y_mm": 40.0, "width_mm": 10.0, "height_mm": 10.0,
+    }
+    # short 恰好贴线（页内 85 -> 纸面 x=5）合格
+    result = _trim(
+        [(2, [(85.0, 50, 10, 10)])], duplex_flip="short", outer_trim_mm=5.0
+    )
+    assert result["violations"] == []
+    # long 背面换槽：第 2 页在背面右槽，页内 (85,50,5.00000005,10) ->
+    # 纸面右缘 190.00000005 越外侧线 190；恰好 190 合格
+    result = _trim([(2, [(85, 50, 5.00000005, 10)])])
+    assert _edges(result) == [(1, 1, "back", 2, "outer")]
+    assert _trim([(2, [(85, 50, 5.0, 10)])])["violations"] == []
+
+
 def test_invalid_page_number_raises():
     with pytest.raises(ValueError):
         _trim([(5, [(0, 0, 1, 1)])])

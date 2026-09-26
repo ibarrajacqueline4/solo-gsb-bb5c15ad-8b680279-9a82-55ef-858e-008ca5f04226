@@ -1992,6 +1992,66 @@ def test_trim_safety_overlapping_rectangles_allowed():
     assert response.status_code == 200
 
 
+def test_trim_safety_sub_tolerance_outer_violation_regression():
+    # 回归：页宽高 100、外裁 5 时，第 4 页矩形 x=4.99999995 严格越过外侧
+    # 安全线（旧实现按 1e-9 级浮点容差误判为贴线合格）
+    body = {
+        **TRIM_SAFETY_BASE,
+        "outer_trim_mm": 5.0,
+        "page_protected": [
+            {"page": 4, "rectangles": [
+                {"x_mm": 4.99999995, "y_mm": 10, "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    violations = response.json()["violations"]
+    assert [(v["page"], v["edge"]) for v in violations] == [(4, "outer")]
+    assert violations[0]["rectangle"] == {
+        "x_mm": 4.99999995, "y_mm": 10.0, "width_mm": 10.0, "height_mm": 10.0,
+    }
+    # 恰好贴线（x=5.0）仍合格
+    body["page_protected"][0]["rectangles"][0]["x_mm"] = 5.0
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    assert response.json()["violations"] == []
+
+
+def test_trim_safety_huge_gutter_violations_regression():
+    # 回归：中缝 1e12 时旧容差随纸面尺寸放大到约 1000 mm，
+    # 矩形 (0,0,10,10) 连顶边与外侧越线也被漏报
+    body = {
+        **TRIM_SAFETY_BASE,
+        "gutter_mm": 1e12,
+        "outer_trim_mm": 5.0,
+        "page_protected": [
+            {"page": 4, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["paper_width_mm"] == 1000000000200.0
+    assert [v["edge"] for v in data["violations"]] == ["top", "outer"]
+
+
+def test_trim_safety_marginally_out_of_page_returns_422():
+    # 回归：页内矩形任何越界均 422（旧实现按容差夹回页面后继续检查）
+    for rect in (
+        {"x_mm": 99.999999995, "y_mm": 0, "width_mm": 0.00000001, "height_mm": 10},
+        {"x_mm": -0.000000001, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+    ):
+        body = {
+            **TRIM_SAFETY_BASE,
+            "page_protected": [{"page": 1, "rectangles": [rect]}],
+        }
+        response = client.post("/api/v1/impose/trim-safety", json=body)
+        assert response.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # 订针计划 /api/v1/impose/staple-plan
 # ---------------------------------------------------------------------------
